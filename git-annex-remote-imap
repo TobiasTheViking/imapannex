@@ -1,0 +1,450 @@
+#!/usr/bin/env python2
+import io
+import os
+import re
+import sys
+import json
+import time
+import imaplib
+#import email
+from email import message_from_string
+from email.mime.multipart import MIMEMultipart
+from email.MIMEText import MIMEText
+from email.MIMEBase import MIMEBase
+from email import Encoders
+
+try:
+    dbglevel = int(os.getenv("DBGLEVEL") or 0)
+except:
+    dbglevel = 0
+    
+version = "0.2.0"
+conf = {"version": version}
+plugin = "imapannex-" + version
+
+pwd = os.path.realpath(__file__)
+pwd = pwd[:pwd.rfind("/")]
+if dbglevel:
+    sys.stderr.write("Path: " + repr(pwd) + "\n")
+
+sys.path.append(pwd + '/lib')
+
+import CommonFunctions as common
+
+common.size_modifier = 1.33
+
+imap = False
+
+def login():
+    common.log("")
+    global imap
+    if conf["imap-ssl"].find("SSL/TLS") > -1:
+        common.log("Connecting to %s with SSL" % conf["imap-host"])
+        imap = imaplib.IMAP4_SSL(conf["imap-host"], int(conf["imap-port"]))
+    else:
+        common.log("Connecting to %s without SSL" % conf["imap-host"])
+        imap = imaplib.IMAP4(conf["imap-host"], int(conf["imap-port"]))
+
+    imap.login(conf["imap-username"], conf["imap-password"])
+
+    common.log("res: " + repr(imap), 2)
+    if imap:
+        common.log("Done")
+        return True
+    else:
+        common.log("Failure")
+        return False
+
+def postFile(subject, filename, folder):
+    common.log("%s to %s - %s" % ( repr(filename), folder, subject))
+
+    filesize = os.path.getsize(filename)
+    msg_id = findInFolder(subject, folder)
+    if msg_id:
+        common.log("File already exists: " + repr(msg_id))
+        return True
+
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = folder
+
+    part = MIMEBase('application', "octet-stream")
+    filedata = common.readFile(filename, "rb")
+    part.set_payload( filedata )
+    Encoders.encode_base64(part)
+    part.add_header('Content-Disposition', 'attachment; filename="%s"' % os.path.basename(filename))
+
+    msg.attach(part)
+    msg_string = msg.as_string()
+    mod = float(len(msg_string)) / float(filesize)
+    common.log("Size modifier changed from %s to %s" % ( common.size_modifier, mod))
+    common.size_modifier = mod
+    
+    def inject_send(data):
+        """Send data to remote."""
+        tsent = 0
+        bytes = len(data)
+        chunksize = filesize / 100
+        if chunksize < 4096:
+            chunksize = 4096
+        while bytes > 0:
+            sent = imap.sslobj.write(data[:chunksize])
+            if sent == bytes:
+                common.progress(filesize, bytes)
+                break    # avoid copy
+            tsent += sent
+            common.progress(filesize, tsent)
+            data = data[sent:]
+            bytes = bytes - sent
+
+    # Inject altered imap send
+    imap.org_send = imap.send
+    imap.send = inject_send
+
+    try:
+        res = imap.append(conf["folder"], "", time.time(), msg_string)
+    except Exception as e:
+        res = False
+        common.log("Exception: " + repr(e))
+        if repr(e).lower().find("message too large.") > -1:
+            common.updateWanted(filesize - 200000, False)
+
+    # Restore original imap send
+    imap.send = imap.org_send
+
+    if res and res[0].find("OK") > -1:
+        common.log("Done: " + repr(res))
+        return True
+    else:
+        common.log("Failed: " + repr(res))
+        return False
+
+def findFolder(subject):
+    common.log(repr(subject), 0)
+
+    typ, data = imap.list()
+    common.log("List: " + repr(data),3 )
+    typ, data2 = imap.select()
+    common.log("Select: " + repr(data2), 3)
+
+    for item in data: # Search for folders
+        if not item:
+            continue
+        item = item.split('"')
+        if len(item) > 1 and item[0] != "0":
+            item = item[3].decode("ascii").strip()
+            common.log("name: " + repr(item) + " - " + repr(subject), 3)
+            if item.find("/") > -1:
+                item = item[item.rfind("/") + 1:]
+
+            if item == subject:
+                common.log("Done, found folder: " + repr(item))
+                return item
+    common.log("Failure")
+    return False
+
+def findInFolder(subject, sender):
+    common.log("%s - %s" % (repr(subject), type(subject), ), 0)
+
+    typ, data = imap.list(conf["folder"])
+    common.log("List: " + repr(data), 2)
+    typ, data2 = imap.select(conf["folder"])
+    common.log("Select: " + repr(data2), 2)
+
+    typ, data3 = imap.search(None, '(FROM "' + sender + '")')
+    common.log("Search: " + repr(data3), 1)
+    if data3 != ['']:
+        try:
+            resp, data = imap.fetch(data3[0].replace(" ", ","), '(BODY[HEADER.FIELDS (SUBJECT)])')
+            common.log("Fetch: " + repr(resp) + " - " + repr(data), 1)
+        except Exception as e:
+            common.log("Exception: " + repr(e))
+            data = []
+                
+        for item in data: # Searches for messages
+            if len(item) > 1 and item[0] != "0":
+                tsub = re.compile("Subject: (.*?)\r\n\r\n").findall(item[1])
+                common.log("name2: " + repr(tsub) + " - " + repr(subject), 2)
+                if len(tsub) and tsub[0].strip() == subject:
+                    msgid = item[0]
+                    msgid = msgid[:msgid.find(" ")]
+                    common.log("Done, found message: " + repr(msgid))
+                    return msgid
+
+    common.log("Failure")
+    return False
+
+def checkFile(subject, folder):
+    common.log(subject)
+    global m
+
+    msg_id = findInFolder(subject, folder)
+    if msg_id:
+        common.log("Found: " + repr(msg_id))
+        return True
+    else:
+        common.log("Failure")
+        return False
+
+def getFile(subject, filename, folder):
+    common.log(subject)
+
+    def inject_get_response():
+        common.log("")
+        # Read response and store.
+        #                        
+        # Returns None for continuation responses, 
+        # otherwise first response line received. 
+        resp = imap._get_line()
+
+        # Command completion response?            
+
+        if imap._match(imap.tagre, resp):
+            tag = imap.mo.group('tag')
+            if not tag in imap.tagged_commands:
+                raise imap.abort('unexpected tagged response: %s' % resp)
+
+            typ = imap.mo.group('type')
+            dat = imap.mo.group('data')
+            imap.tagged_commands[tag] = (typ, [dat])
+        else:
+            dat2 = None
+
+            # '*' (untagged) responses? 
+        
+            if not imap._match(imaplib.Untagged_response, resp):
+                if imap._match(imaplib.Untagged_status, resp):
+                    dat2 = imap.mo.group('data2')
+
+            if imap.mo is None:
+                # Only other possibility is '+' (continuation) response...  
+
+                if imap._match(imaplib.Continuation, resp):
+                    imap.continuation_response = imap.mo.group('data')
+                    return None     # NB: indicates continuation            
+
+                raise imap.abort("unexpected response: '%s'" % resp)
+
+            typ = imap.mo.group('type')
+            dat = imap.mo.group('data')
+            if dat is None: dat = ''        # Null untagged response
+            if dat2: dat = dat + ' ' + dat2
+
+            # Is there a literal to come?
+
+
+            while imap._match(imaplib.Literal, dat):
+
+                # Read literal direct from connection.
+                size = int(imap.mo.group('size'))
+                if __debug__:
+                    if imap.debug >= 4:
+                        imap._mesg('read literal size %s' % size)
+
+                data = False
+                tdata = ""
+                tsize = size
+                chunksize = size / 100
+                if chunksize < 4096:
+                    chunksize = 4096
+                while not data or len(tdata) > 0:
+                    if tsize > chunksize:
+                        tsize = chunksize
+                    tdata = imap.read(tsize)
+                
+                    if not data:
+                        data = tdata
+                    else:
+                        data += tdata
+                    common.progress(size, len(data))
+                    tsize = size - len(data)
+
+                # Store response with literal as tuple
+                imap._append_untagged(typ, (dat, data))
+
+                # Read trailer - possibly containing another literal
+
+                dat = imap._get_line()
+
+                imap._append_untagged(typ, dat)
+
+                # Bracketed response information?
+
+                if typ in ('OK', 'NO', 'BAD') and imap._match(imaplib.Response_code, dat):
+                    imap._append_untagged(imap.mo.group('type'), imap.mo.group('data'))
+
+                if __debug__:
+                    if imap.debug >= 1 and typ in ('NO', 'BAD', 'BYE'):
+                        imap._mesg('%s response: %s' % (typ, dat))
+
+        return resp
+
+    msg_id = findInFolder(subject, folder)
+    if msg_id:
+        common.log("msg_id: " + repr(msg_id))
+
+        imap.org_get_response = imap._get_response
+        imap._get_response = inject_get_response
+        resp, content = imap.fetch(msg_id, "(RFC822)")
+
+        imap._get_response = imap.org_get_response
+
+        mail = message_from_string(content[0][1])
+
+        for part in mail.walk():
+            if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
+                continue
+
+            common.saveFile(filename, part.get_payload(decode=True), "wb")
+            common.log("Done")
+            return True
+    common.log("Failure")
+    return False
+
+def deleteFile(subject, folder):
+    common.log(subject)
+    global m
+
+    msg_id = findInFolder(subject, folder)
+
+    #typ, data = imap.search(None, 'ALL')
+    #for num in data[0].split():
+    common.log("msg_id: " + repr(msg_id))
+    if msg_id:
+        res = imap.store(msg_id[0], '+FLAGS', '\\Deleted')
+        imap.expunge()
+        common.log("Done")
+        return True
+    common.log("Failure")
+
+def createFolder(path="", folder=""):
+    common.log(repr(path) + " - " + repr(folder))
+    if len(path):
+        res = imap.create(path + "/" + folder)
+        common.log("Done: "+ repr(res))
+        return path + "/" + folder
+    else:
+        res = imap.create(folder)
+        common.log("Done: "+ repr(res))
+        return folder
+
+def setFolder(base, keys):
+    common.log(repr(base) + " - " + repr(keys))
+
+    folder = findFolder(base)
+    keys = keys.replace("VALUE ", "").split("/")
+
+    if folder:
+        common.log("Using folder: " + repr(folder))
+        ANNEX_FOLDER = folder
+    else:
+        folder = createFolder(folder=base)
+        common.log("created folder0: " + repr(folder))
+        ANNEX_FOLDER = folder
+
+    if keys[0]:
+        ANNEX_FOLDER += "/" + keys[0]
+
+    if keys[1]:
+        ANNEX_FOLDER += "/" + keys[1]
+    return ANNEX_FOLDER
+
+## gaproto interface
+
+def initremote(line):
+    common.log("")
+    uname = os.getenv("USERNAME") or ""
+    pword = os.getenv("PASSWORD") or ""
+                
+    imapmethod = common.getConfig("method")
+    imapssl = common.getConfig("ssl")
+    imaphost = common.getConfig("host")
+    imapport = common.getConfig("port")
+    myfolder = common.getConfig("folder")
+    encryption = common.getConfig("encryption")
+
+    if len(uname) and len(pword) and len(imapmethod) and len(imapssl) and len(imaphost) and len(imapport) and len(myfolder):
+        common.sprint('SETCREDS mycreds ' + uname + ' ' + pword)
+        common.sprint('INITREMOTE-SUCCESS')
+    else:
+        common.sprint('INITREMOTE-FAILURE You need to set USERNAME and PASSWORD environment variables and host, port, method, ssl, folder and encryption parameters when running initremote.')
+    common.log("Done")
+
+def prepare(line):
+    common.log("")
+    creds = common.getCreds()
+
+    imapmethod = common.getConfig("method")
+    imapssl = common.getConfig("ssl")
+    imaphost = common.getConfig("host")
+    imapport = common.getConfig("port")
+    myfolder = common.getConfig("folder")
+    encryption = common.getConfig("encryption")
+
+    if len(creds) > 2 and len(imapmethod) and len(imapssl) and len(imaphost) and len(imapport) and len(myfolder) and ( len(creds[1]) and len(creds[2])):
+        conf["imap-username"] = creds[1]
+        conf["imap-password"] = creds[2]
+        conf["imap-method"] = imapmethod
+        conf["imap-ssl"] = imapssl
+        conf["imap-host"] = imaphost
+        conf["imap-port"] = imapport
+        conf["folder"] = myfolder
+        conf["encryption"] = encryption.lower().find("none") == -1
+        common.updateWanted(False, False)
+        common.sprint('DEBUG ' + plugin)
+        if login():
+            common.sprint('PREPARE-SUCCESS')
+            common.use_sprint = False
+        else:
+            common.sprint('PREPARE-FAILURE Login failure.')
+    else:
+        common.sprint('PREPARE-FAILURE You need to set USERNAME and PASSWORD environment variables and host, port, method, ssl, folder parameters for the remote.')
+    common.log("")
+
+def transfer(line):
+    common.log("")
+    folder = setFolder(conf["folder"], common.ask("DIRHASH " + line[2]))
+    if line[1] == "STORE":
+        if postFile(line[2], " ".join(line[3:]), folder):
+            common.sprint('TRANSFER-SUCCESS STORE ' + line[2] + '')
+        else:
+            common.sprint('TRANSFER-FAILURE STORE ' + line[2] + ' File could not be stored')
+    if line[1] == "RETRIEVE":
+        if getFile(line[2], " ".join(line[3:]), folder):
+            common.sprint('TRANSFER-SUCCESS RETRIEVE ' + line[2] + '')
+        else:
+            common.sprint('TRANSFER-FAILURE RETRIEVE ' + line[2] + ' File could not be retrieved')
+    common.log("Done")
+
+def checkpresent(line):
+    common.log("")
+    folder = setFolder(conf["folder"], common.ask("DIRHASH " + line[1]))
+    if not len(folder):
+        common.sprint('CHECKPRESENT-UNKNOWN ' + line[1] + ' this remote is not currently available')
+        return None
+
+    if checkFile(line[1], folder):
+        common.sprint('CHECKPRESENT-SUCCESS ' + line[1] + '')
+    else:
+        common.sprint('CHECKPRESENT-FAILURE ' + line[1] + '')
+    common.log("Done")
+
+def remove(line):
+    common.log("")
+    folder = setFolder(conf["folder"], common.ask("DIRHASH " + line[1]))
+                
+    if deleteFile(line[1], folder):
+        common.sprint('REMOVE-SUCCESS ' + line[1] + '')
+    else:
+        common.sprint('REMOVE-FAILURE ' + line[1] + ' This file could not be removed')
+    common.log("Done")
+
+def getCost():
+    common.log("", 3)
+    common.sprint("COST 150")
+
+t = time.time()
+common.log("START")
+if __name__ == '__main__':
+    common.startRemote()
+common.log("STOP: %ss" % int(time.time() - t))
